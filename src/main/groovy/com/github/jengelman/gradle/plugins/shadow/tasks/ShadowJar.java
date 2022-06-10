@@ -1,28 +1,52 @@
 package com.github.jengelman.gradle.plugins.shadow.tasks;
 
+import java.io.File;
+import java.lang.reflect.InvocationTargetException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+
 import com.github.jengelman.gradle.plugins.shadow.ShadowStats;
-import com.github.jengelman.gradle.plugins.shadow.internal.*;
+import com.github.jengelman.gradle.plugins.shadow.internal.DefaultDependencyFilter;
+import com.github.jengelman.gradle.plugins.shadow.internal.DependencyFilter;
+import com.github.jengelman.gradle.plugins.shadow.internal.GradleVersionUtil;
+import com.github.jengelman.gradle.plugins.shadow.internal.MinimizeDependencyFilter;
+import com.github.jengelman.gradle.plugins.shadow.internal.UnusedTracker;
+import com.github.jengelman.gradle.plugins.shadow.internal.ZipCompressor;
 import com.github.jengelman.gradle.plugins.shadow.relocation.CacheableRelocator;
 import com.github.jengelman.gradle.plugins.shadow.relocation.Relocator;
 import com.github.jengelman.gradle.plugins.shadow.relocation.SimpleRelocator;
-import com.github.jengelman.gradle.plugins.shadow.transformers.*;
+import com.github.jengelman.gradle.plugins.shadow.transformers.AppendingTransformer;
+import com.github.jengelman.gradle.plugins.shadow.transformers.CacheableTransformer;
+import com.github.jengelman.gradle.plugins.shadow.transformers.GroovyExtensionModuleTransformer;
+import com.github.jengelman.gradle.plugins.shadow.transformers.ServiceFileTransformer;
+import com.github.jengelman.gradle.plugins.shadow.transformers.StandardFilesMergeTransformer;
+import com.github.jengelman.gradle.plugins.shadow.transformers.Transformer;
 import org.gradle.api.Action;
+import org.gradle.api.Task;
 import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.DuplicatesStrategy;
 import org.gradle.api.file.FileCollection;
 import org.gradle.api.internal.DocumentationRegistry;
 import org.gradle.api.internal.file.FileResolver;
 import org.gradle.api.internal.file.copy.CopyAction;
+import org.gradle.api.specs.Spec;
+import org.gradle.api.tasks.CacheableTask;
+import org.gradle.api.tasks.Classpath;
+import org.gradle.api.tasks.InputFiles;
+import org.gradle.api.tasks.Internal;
+import org.gradle.api.tasks.Nested;
+import org.gradle.api.tasks.Optional;
+import org.gradle.api.tasks.PathSensitive;
+import org.gradle.api.tasks.PathSensitivity;
+import org.gradle.api.tasks.SourceSet;
+import org.gradle.api.tasks.SourceSetContainer;
+import org.gradle.api.tasks.TaskAction;
 import org.gradle.api.tasks.*;
 import org.gradle.api.tasks.bundling.Jar;
 import org.gradle.api.tasks.util.PatternSet;
 import org.jetbrains.annotations.NotNull;
-
-import java.io.File;
-import java.lang.reflect.InvocationTargetException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.Callable;
 
 @CacheableTask
 public class ShadowJar extends Jar implements ShadowSpec {
@@ -51,28 +75,49 @@ public class ShadowJar extends Jar implements ShadowSpec {
 
     public ShadowJar() {
         super();
-        setDuplicatesStrategy(DuplicatesStrategy.INCLUDE); //shadow filters out files later. This was the default behavior in  Gradle < 6.x
+        setDuplicatesStrategy(
+                DuplicatesStrategy.INCLUDE); //shadow filters out files later. This was the default behavior in  Gradle < 6.x
+        versionUtil = new GradleVersionUtil(getProject().getGradle().getGradleVersion());
         dependencyFilter = new DefaultDependencyFilter(getProject());
         dependencyFilterForMinimize = new MinimizeDependencyFilter(getProject());
-        setManifest(new DefaultInheritManifest(getProject(), getServices().get(FileResolver.class)));
-        transformers = new ArrayList<>();
+        setManifest(new DefaultInheritManifest(getServices().get(FileResolver.class)));
+        /*
+         Add as default the StandardFilesMergeTransformer, remove it with "removeDefaultTransformers()".
+         This is added by default, because otherwise:
+         a) In projects with many dependencies the user gets flooded with information about duplicated entries
+            like "META-INF/notice.txt", "META-INF/license.txt"...
+         b) Important licensing information written in META-INF/license.txt and other files may be lost.
+         c) Helpful information written in readme files may be lost.
+         d) The merging of plain text files is safe, there is no important logic to follow. Not like MANIFEST.MF,
+            property files, xml files, etc. Merged HTML may not look that good, but it works.
+         */
+        transformers = new ArrayList<>(Collections.singletonList(new StandardFilesMergeTransformer()));
         relocators = new ArrayList<>();
         configurations = new ArrayList<>();
 
-        this.getInputs().property("minimize", (Callable<Boolean>) () -> minimizeJar);
-        this.getOutputs().doNotCacheIf("Has one or more transforms or relocators that are not cacheable", task -> {
-            for (Transformer transformer : transformers) {
-                if (!isCacheableTransform(transformer.getClass())) {
-                    return true;
-                }
+        this.getInputs().property("minimize", new Callable<Boolean>() {
+            @Override
+            public Boolean call() throws Exception {
+                return minimizeJar;
             }
-            for (Relocator relocator : relocators) {
-                if (!isCacheableRelocator(relocator.getClass())) {
-                    return true;
-                }
-            }
-            return false;
         });
+        this.getOutputs().doNotCacheIf("Has one or more transforms or relocators that are not cacheable",
+                new Spec<Task>() {
+                    @Override
+                    public boolean isSatisfiedBy(Task task) {
+                        for (Transformer transformer : transformers) {
+                            if (!isCacheableTransform(transformer.getClass())) {
+                                return true;
+                            }
+                        }
+                        for (Relocator relocator : relocators) {
+                            if (!isCacheableRelocator(relocator.getClass())) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                });
     }
 
     @Override
@@ -105,7 +150,8 @@ public class ShadowJar extends Jar implements ShadowSpec {
     @NotNull
     protected CopyAction createCopyAction() {
         DocumentationRegistry documentationRegistry = getServices().get(DocumentationRegistry.class);
-        final UnusedTracker unusedTracker = minimizeJar ? UnusedTracker.forProject(getApiJars(), getSourceSetsClassesDirs().getFiles(), getToMinimize()) : null;
+        final UnusedTracker unusedTracker = minimizeJar ? UnusedTracker.forProject(getApiJars(),
+                getSourceSetsClassesDirs().getFiles(), getToMinimize()) : null;
         return new ShadowCopyAction(getArchiveFile().get().getAsFile(), getInternalCompressor(), documentationRegistry,
                 this.getMetadataCharset(), transformers, relocators, getRootPatternSet(), shadowStats,
                 isPreserveFileTimestamps(), minimizeJar, unusedTracker);
@@ -121,7 +167,6 @@ public class ShadowJar extends Jar implements ShadowSpec {
         return toMinimize;
     }
 
-
     @Classpath
     FileCollection getApiJars() {
         if (apiJars == null) {
@@ -131,7 +176,6 @@ public class ShadowJar extends Jar implements ShadowSpec {
         }
         return apiJars;
     }
-
 
     @InputFiles
     @PathSensitive(PathSensitivity.RELATIVE)
@@ -213,9 +257,25 @@ public class ShadowJar extends Jar implements ShadowSpec {
      * @return this
      */
     @Override
-    public <T extends Transformer> ShadowJar transform(Class<T> clazz, Action<T> c) throws InstantiationException, IllegalAccessException, NoSuchMethodException, InvocationTargetException {
+    public <T extends Transformer> ShadowJar transform(Class<T> clazz, Action<T> c)
+            throws InstantiationException, IllegalAccessException, NoSuchMethodException, InvocationTargetException {
         T transformer = clazz.getDeclaredConstructor().newInstance();
         addTransform(transformer, c);
+        return this;
+    }
+
+    /**
+     * Removes all default transformers.
+     * <br>Right now only {@link StandardFilesMergeTransformer} is added as default transformer, this method removes
+     * it.
+     *
+     * @return this
+     */
+    public ShadowJar removeDefaultTransformers() {
+        final java.util.Optional<Transformer> standardFilesMergeTransformer = transformers.stream() //
+                .filter(StandardFilesMergeTransformer.class::isInstance) //
+                .findAny();
+        standardFilesMergeTransformer.ifPresent(transformer -> transformers.remove(transformer));
         return this;
     }
 
@@ -340,7 +400,8 @@ public class ShadowJar extends Jar implements ShadowSpec {
      */
     @Override
     public ShadowJar relocate(String pattern, String destination, Action<SimpleRelocator> configure) {
-        SimpleRelocator relocator = new SimpleRelocator(pattern, destination, new ArrayList<>(), new ArrayList<>());
+        SimpleRelocator relocator = new SimpleRelocator(pattern, destination, new ArrayList<String>(),
+                new ArrayList<String>());
         addRelocator(relocator, configure);
         return this;
     }
@@ -364,7 +425,8 @@ public class ShadowJar extends Jar implements ShadowSpec {
      * @return this
      */
     @Override
-    public ShadowJar relocate(Class<? extends Relocator> relocatorClass) throws InstantiationException, IllegalAccessException, NoSuchMethodException, InvocationTargetException {
+    public ShadowJar relocate(Class<? extends Relocator> relocatorClass)
+        throws InstantiationException, IllegalAccessException, NoSuchMethodException, InvocationTargetException {
         return relocate(relocatorClass, null);
     }
 
@@ -384,7 +446,8 @@ public class ShadowJar extends Jar implements ShadowSpec {
      * @return this
      */
     @Override
-    public <R extends Relocator> ShadowJar relocate(Class<R> relocatorClass, Action<R> configure) throws InstantiationException, IllegalAccessException, NoSuchMethodException, InvocationTargetException {
+    public <R extends Relocator> ShadowJar relocate(Class<R> relocatorClass, Action<R> configure)
+            throws InstantiationException, IllegalAccessException, NoSuchMethodException, InvocationTargetException {
         R relocator = relocatorClass.getDeclaredConstructor().newInstance();
         addRelocator(relocator, configure);
         return this;
