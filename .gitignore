@@ -13,8 +13,7 @@ classes/
 node_modules/
 yarn-error.log
 src/docs/.vuepress/dist/
-bin/
 .DS_Store
 jd-gui.cfg
+bin/
 .vscode/
-package-lock.json
